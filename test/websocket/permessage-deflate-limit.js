@@ -216,6 +216,20 @@ test('Agent with default webSocketOptions uses 128 MB limit', async (t) => {
   assert.strictEqual(agent.webSocketOptions.maxPayloadSize, 128 * 1024 * 1024)
 })
 
+test('Agent webSocketOptions.maxFragments is read correctly and defaults to 131072', async (t) => {
+  const agent = new Agent()
+  const customAgent = new Agent({
+    webSocket: {
+      maxFragments: 16
+    }
+  })
+
+  t.after(() => Promise.all([agent.close(), customAgent.close()]))
+
+  assert.strictEqual(agent.webSocketOptions.maxFragments, 131072)
+  assert.strictEqual(customAgent.webSocketOptions.maxFragments, 16)
+})
+
 test('Custom maxPayloadSize allows messages under limit', async (t) => {
   const server = new WebSocketServer({
     port: 0,
@@ -567,7 +581,7 @@ test('Decompression bomb is mitigated via raw WebSocket handshake', async (t) =>
   // by creating a minimal malicious server that sends a compressed payload
   let messageReceived = false
 
-  const { server } = await createRawServer(t, (socket) => {
+  const { server, closeCode } = await createRawServer(t, (socket) => {
     // Send a small payload that decompresses to ~10 MB
     setTimeout(() => {
       const bomb = createCompressedPayload(10 * 1024 * 1024)
@@ -596,13 +610,14 @@ test('Decompression bomb is mitigated via raw WebSocket handshake', async (t) =>
   // The message should NOT have been received due to size limit
   assert.ok(closed, 'Connection should be closed after exceeding limit')
   assert.strictEqual(messageReceived, false)
+  assert.strictEqual(await closeCode, 1009, 'Client should close with 1009 (Message Too Big)')
 })
 
 test('Decompression bomb is mitigated with the default configuration', async (t) => {
   // No dispatcher is configured: the default 128 MB limit must apply.
   let messageReceived = false
 
-  const { server } = await createRawServer(t, (socket) => {
+  const { server, closeCode } = await createRawServer(t, (socket) => {
     setTimeout(() => {
       // ~130 KB on the wire, 129 MB once inflated.
       const bomb = createCompressedPayload(129 * 1024 * 1024)
@@ -620,12 +635,13 @@ test('Decompression bomb is mitigated with the default configuration', async (t)
 
   assert.ok(closed, 'Connection should be closed after exceeding the default limit')
   assert.strictEqual(messageReceived, false)
+  assert.strictEqual(await closeCode, 1009, 'Client should close with 1009 (Message Too Big)')
 })
 
 test('Oversized frame is rejected with the default configuration before its payload arrives', async (t) => {
   let messageReceived = false
 
-  const { server } = await createRawServer(t, (socket) => {
+  const { server, closeCode } = await createRawServer(t, (socket) => {
     setTimeout(() => {
       // Announce a 200 MB compressed frame but never send its payload: the
       // client must not wait for (and buffer) it.
@@ -644,12 +660,13 @@ test('Oversized frame is rejected with the default configuration before its payl
   assert.ok(closed, 'Connection should be closed after exceeding the default limit')
   assert.strictEqual(messageReceived, false)
   assert.strictEqual(client.readyState, WebSocket.CLOSED)
+  assert.strictEqual(await closeCode, 1009, 'Client should close with 1009 (Message Too Big)')
 })
 
 test('Default limit applies when the dispatcher does not expose webSocketOptions', async (t) => {
   let messageReceived = false
 
-  const { server } = await createRawServer(t, (socket) => {
+  const { server, closeCode } = await createRawServer(t, (socket) => {
     setTimeout(() => {
       socket.write(createWebSocketFrameHeader({ opcode: 2, rsv1: true, length: 200 * 1024 * 1024 }))
     }, 100)
@@ -671,6 +688,184 @@ test('Default limit applies when the dispatcher does not expose webSocketOptions
 
   assert.ok(closed, 'Connection should be closed after exceeding the default limit')
   assert.strictEqual(messageReceived, false)
+  assert.strictEqual(await closeCode, 1009, 'Client should close with 1009 (Message Too Big)')
+})
+
+test('cumulative payload size', (t, done) => {
+  const LIMIT = 100
+  const FRAGMENT_SIZE = 60
+  const NUM_FRAGMENTS = 10
+
+  const server = new WebSocketServer({ port: 0 })
+
+  server.on('connection', (ws) => {
+    const socket = ws._socket
+    const payload = Buffer.alloc(FRAGMENT_SIZE, 0x41)
+
+    for (let i = 0; i < NUM_FRAGMENTS; i++) {
+      const fin = i === NUM_FRAGMENTS - 1 ? 0x80 : 0x00
+      const opcode = i === 0 ? 0x02 : 0x00
+      const header = Buffer.alloc(2)
+      header[0] = fin | opcode
+      header[1] = FRAGMENT_SIZE
+      socket.write(header)
+      socket.write(payload)
+    }
+  })
+
+  const agent = new Agent({
+    webSocket: {
+      maxPayloadSize: LIMIT
+    }
+  })
+
+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, { dispatcher: agent })
+
+  t.after(async () => {
+    client.close()
+    server.close()
+    await agent.close()
+  })
+
+  client.onmessage = () => assert.fail('message should not be received')
+
+  client.addEventListener('error', (event) => {
+    assert.ok(event)
+    done()
+  })
+})
+
+test('cumulative payload size is enforced when a frame announces its length', (t, done) => {
+  // A first fragment sitting exactly on the limit does not trip the check that
+  // runs after the payload is buffered, so the only thing that can stop the
+  // peer from announcing yet another limit-sized continuation frame is the
+  // announce-time check - and that check has to account for the bytes that
+  // were already accumulated. The body of the second frame is deliberately
+  // never written: a parser that validates the announced length on its own
+  // waits for those bytes forever while holding onto the first fragment.
+  const LIMIT = 100
+
+  function maybeDone () {
+    if (++maybeDone.callCount === 2) {
+      done()
+    }
+  }
+
+  maybeDone.callCount = 0
+
+  const server = new WebSocketServer({ port: 0 })
+
+  server.on('connection', (ws) => {
+    ws.on('error', () => {})
+
+    ws.on('close', (code, reason) => {
+      assert.strictEqual(code, 1009)
+      assert.strictEqual(reason.toString(), 'Payload size exceeds maximum allowed size')
+      maybeDone()
+    })
+
+    const socket = ws._socket
+
+    // Binary frame, fin = 0, payload length === LIMIT (fills the whole budget).
+    socket.write(Buffer.from([0x02, LIMIT]))
+    socket.write(Buffer.alloc(LIMIT, 0x41))
+
+    // Continuation frame, fin = 1, announcing another LIMIT bytes. Header only.
+    socket.write(Buffer.from([0x80, LIMIT]))
+  })
+
+  const agent = new Agent({
+    webSocket: {
+      maxPayloadSize: LIMIT
+    }
+  })
+
+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, { dispatcher: agent })
+
+  t.after(async () => {
+    client.close()
+    server.close()
+    await agent.close()
+  })
+
+  client.onmessage = () => assert.fail('message should not be received')
+
+  client.addEventListener('error', () => {
+    assert.ok(true)
+  })
+
+  client.addEventListener('close', (event) => {
+    assert.strictEqual(event.code, 1006)
+    maybeDone()
+  })
+})
+
+/**
+ * Creates `count` empty, non-final fragments of a single binary message.
+ * @param {number} count
+ * @returns {Buffer}
+ */
+function createEmptyFragments (count) {
+  const frames = Buffer.alloc(count * 2)
+
+  // Binary frame, fin = 0, length = 0, followed by continuation frames,
+  // fin = 0, length = 0 (all bytes already zero).
+  frames[0] = 0x02
+
+  return frames
+}
+
+test('Too many fragments are rejected with the default configuration', async (t) => {
+  // No dispatcher is configured: the default limit of 131072 fragments must
+  // apply, so a peer cannot grow the fragment list without bound.
+  let messageReceived = false
+
+  const { server, closeCode } = await createRawServer(t, (socket) => {
+    setTimeout(() => {
+      socket.write(createEmptyFragments(131072 + 1))
+    }, 100)
+  })
+
+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
+
+  client.addEventListener('message', () => {
+    messageReceived = true
+  })
+
+  const closed = await raceTimeout(once(client, 'close'), 10000)
+
+  assert.ok(closed, 'Connection should be closed after exceeding the default fragment limit')
+  assert.strictEqual(messageReceived, false)
+  assert.strictEqual(client.readyState, WebSocket.CLOSED)
+  assert.strictEqual(await closeCode, 1008, 'Client should close with 1008 (Policy Violation)')
+})
+
+test('Default fragment limit applies when the dispatcher does not expose webSocketOptions', async (t) => {
+  let messageReceived = false
+
+  const { server, closeCode } = await createRawServer(t, (socket) => {
+    setTimeout(() => {
+      socket.write(createEmptyFragments(131072 + 1))
+    }, 100)
+  })
+
+  const agent = new Agent()
+  t.after(() => agent.close())
+
+  const dispatcher = new ForwardingDispatcher(agent)
+  assert.strictEqual(dispatcher.webSocketOptions, undefined)
+
+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, { dispatcher })
+
+  client.addEventListener('message', () => {
+    messageReceived = true
+  })
+
+  const closed = await raceTimeout(once(client, 'close'), 10000)
+
+  assert.ok(closed, 'Connection should be closed after exceeding the default fragment limit')
+  assert.strictEqual(messageReceived, false)
+  assert.strictEqual(await closeCode, 1008, 'Client should close with 1008 (Policy Violation)')
 })
 
 test('Malformed over-limit compressed payload closes connection without unhandled error', async (t) => {
