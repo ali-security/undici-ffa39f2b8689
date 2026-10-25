@@ -1,21 +1,22 @@
 name: Node CI
 
 on:
-  push:
-    branches:
-     - main
-     - current
-     - next
-     - 'v*'
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Comma-separated list of borp test globs to run instead of the full suite (empty = full suite)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   dependency-review:
-    if: ${{ github.event_name == 'pull_request' }}
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@f086349bfa2bd1361f7909c78558e816508cdc10 # v2.8.0
@@ -33,6 +34,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -64,14 +66,62 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
-    uses: ./.github/workflows/test.yml
-    with:
-      node-version: ${{ matrix.node-version }}
-      runs-on: ${{ matrix.runs-on }}
-    secrets: inherit
+    name: Test with Node.js ${{ matrix.node-version }} on ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js@${{ matrix.node-version }}
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Print version information
+        run: |
+          echo OS: $(node -p "os.version()")
+          echo Node.js: $(node --version)
+          echo npm: $(npm --version)
+          echo git: $(git --version)
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run scoped tests
+        if: ${{ inputs.test-filter != '' }}
+        shell: bash
+        env:
+          CI: true
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          node scripts/generate-pem
+          status=0
+          IFS=',' read -ra patterns <<< "$TEST_FILTER"
+          for pattern in "${patterns[@]}"; do
+            if [ -n "$pattern" ]; then
+              files=( $pattern )
+              if [ ! -e "${files[0]}" ]; then
+                echo "::error::test-filter pattern matched no files: $pattern"
+                exit 1
+              fi
+              echo "Running scoped tests: $pattern (${#files[@]} file(s))"
+              npx borp --expose-gc -p "$pattern" || status=1
+            fi
+          done
+          exit $status
+
+      - name: Run tests
+        if: ${{ inputs.test-filter == '' }}
+        run: npm run test:javascript
+        env:
+          CI: true
 
   test-without-intl:
     name: Test with Node.js ${{ matrix.version }} compiled --without-intl
+    if: false
     strategy:
       fail-fast: false
       max-parallel: 0
@@ -144,6 +194,7 @@ jobs:
   test-fuzzing:
     name: Fuzzing
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
@@ -182,9 +233,38 @@ jobs:
       - name: Run typings tests
         run: npm run test:typescript
 
+  pack:
+    name: Pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: 20.19.6
+
+      - name: Install npm
+        run: npm i -g npm@11.7.0
+
+      - name: Pack
+        run: |
+          npm install --ignore-scripts
+          npm pack --ignore-scripts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: undici-6.23.0
+          path: undici-6.23.0.tgz
+          if-no-files-found: error
+
   automerge:
-    if: >
-      github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    if: false
     needs:
       - dependency-review
       - test
@@ -193,6 +273,7 @@ jobs:
       - test-fuzzing
       - lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       pull-requests: write

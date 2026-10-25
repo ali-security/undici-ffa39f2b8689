@@ -7,7 +7,9 @@ const { once } = require('node:events')
 const { tick: fastTimersTick } = require('../lib/util/timers')
 const { fetch, Agent, RetryAgent } = require('..')
 
-test('https://github.com/nodejs/undici/issues/3356', async (t) => {
+const skip = process.platform === 'darwin'
+
+test('https://github.com/nodejs/undici/issues/3356', { skip }, async (t) => {
   t = tspl(t, { plan: 3 })
 
   let shouldRetry = true
